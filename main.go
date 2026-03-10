@@ -56,6 +56,15 @@ func init() {
 }
 
 func main() {
+	// 全局 panic 捕获，防止 Windows 控制台闪退看不到错误
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[FATAL] 程序崩溃: %v", r)
+			fmt.Println("\n按回车键退出...")
+			fmt.Scanln()
+		}
+	}()
+
 	if listDevices {
 		printDeviceList()
 		os.Exit(0)
@@ -69,7 +78,7 @@ func main() {
 }
 
 // ==========================================
-// 设备枚举 (带分辨率详情)
+// 设备枚举
 // ==========================================
 
 func printDeviceList() {
@@ -83,7 +92,7 @@ func printDeviceList() {
 		fmt.Printf("\n  [摄像头 %d] %s\n", i, info.Label)
 
 		if err := d.Open(); err != nil {
-			fmt.Printf("    (无法打开设备查询分辨率: %v)\n", err)
+			fmt.Printf("    (无法打开: %v)\n", err)
 			continue
 		}
 		props := d.Properties()
@@ -96,7 +105,11 @@ func printDeviceList() {
 
 		seen := make(map[string]bool)
 		for _, p := range props {
-			key := fmt.Sprintf("%dx%d @ %.0ffps (%s)", p.Width, p.Height, p.FrameRate, p.FrameFormat)
+			fpsStr := fmt.Sprintf("%.0f", p.FrameRate)
+			if p.FrameRate <= 0 {
+				fpsStr = "auto"
+			}
+			key := fmt.Sprintf("%dx%d @ %sfps (%s)", p.Width, p.Height, fpsStr, p.FrameFormat)
 			if !seen[key] {
 				seen[key] = true
 				fmt.Printf("    - %s\n", key)
@@ -116,7 +129,7 @@ func printDeviceList() {
 }
 
 // ==========================================
-// 服务端逻辑 (接收端 + 拼图渲染)
+// 服务端逻辑
 // ==========================================
 
 type App struct {
@@ -165,14 +178,27 @@ func runServer() {
 			fmt.Println("[Server] 客户端已连接！")
 
 			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("[Server] 处理客户端时崩溃: %v", r)
+					}
+				}()
+
 				stream, err := conn.AcceptStream(context.Background())
 				if err != nil {
+					log.Println("[Server] 接收 Stream 失败:", err)
 					return
 				}
 
 				var frameW, frameH uint16
-				binary.Read(stream, binary.BigEndian, &frameW)
-				binary.Read(stream, binary.BigEndian, &frameH)
+				if err := binary.Read(stream, binary.BigEndian, &frameW); err != nil {
+					log.Println("[Server] 读取宽度失败:", err)
+					return
+				}
+				if err := binary.Read(stream, binary.BigEndian, &frameH); err != nil {
+					log.Println("[Server] 读取高度失败:", err)
+					return
+				}
 				fmt.Printf("[Server] 客户端画面尺寸: %dx%d\n", frameW, frameH)
 
 				app.mu.Lock()
@@ -236,7 +262,7 @@ func runServer() {
 }
 
 // ==========================================
-// 客户端逻辑 (摄像头采集 + 网格差异推流)
+// 客户端逻辑
 // ==========================================
 
 func runClient() {
@@ -246,113 +272,165 @@ func runClient() {
 	fmt.Printf("[Client] 正在连接服务端 %s...\n", address)
 	conn, err := quic.DialAddr(context.Background(), address, tlsConf, nil)
 	if err != nil {
-		log.Fatal("连接失败:", err)
+		log.Fatalf("[Client] 连接失败: %v", err)
 	}
+	fmt.Println("[Client] QUIC 连接成功！")
 
 	stream, err := conn.OpenStreamSync(context.Background())
 	if err != nil {
-		log.Fatal("开启 Stream 失败:", err)
+		log.Fatalf("[Client] 开启 Stream 失败: %v", err)
 	}
+	fmt.Println("[Client] Stream 已建立！")
 
 	// 1. 查找并打开摄像头
 	videoDrivers := driver.GetManager().Query(driver.FilterVideoRecorder())
 	if len(videoDrivers) == 0 {
-		log.Fatal("未找到任何摄像头设备")
+		log.Fatal("[Client] 未找到任何摄像头设备")
 	}
 	if camID >= len(videoDrivers) {
-		log.Fatalf("摄像头序号 %d 不存在，最大为 %d", camID, len(videoDrivers)-1)
+		log.Fatalf("[Client] 摄像头序号 %d 不存在，最大为 %d", camID, len(videoDrivers)-1)
 	}
 
 	cam := videoDrivers[camID]
 	fmt.Printf("[Client] 正在打开摄像头: %s\n", cam.Info().Label)
 
 	if err := cam.Open(); err != nil {
-		log.Fatalf("打开摄像头失败: %v", err)
+		log.Fatalf("[Client] 打开摄像头失败: %v", err)
 	}
 	defer cam.Close()
 
 	recorder, ok := cam.(driver.VideoRecorder)
 	if !ok {
-		log.Fatal("该设备不支持视频录制")
+		log.Fatal("[Client] 该设备不支持视频录制")
 	}
 
 	// 2. 智能选择最佳分辨率
 	targetW, targetH := parseTargetRes(targetRes)
 	selectedProp := selectBestProp(cam.Properties(), targetW, targetH)
-	fmt.Printf("[Client] 摄像头实际输出: %dx%d @ %.0f fps\n", selectedProp.Width, selectedProp.Height, selectedProp.FrameRate)
+	fmt.Printf("[Client] 最终采集参数: %dx%d @ %.0f fps (格式: %s)\n",
+		selectedProp.Width, selectedProp.Height, selectedProp.FrameRate, selectedProp.FrameFormat)
 
 	// 3. 启动采集
+	fmt.Println("[Client] 正在启动视频采集...")
 	reader, err := recorder.VideoRecord(selectedProp)
 	if err != nil {
-		log.Fatalf("启动视频采集失败: %v", err)
+		log.Fatalf("[Client] 启动视频采集失败: %v", err)
 	}
+	fmt.Println("[Client] 视频采集器已启动！")
 
 	actualW := selectedProp.Width
 	actualH := selectedProp.Height
-	fmt.Printf("[Client] 摄像头启动成功，目标 %dx%d，推流中 (%d FPS)...\n", actualW, actualH, FrameRate)
 
-	// 4. 先发送画面尺寸给服务端
+	// 4. 发送画面尺寸给服务端
 	binary.Write(stream, binary.BigEndian, uint16(actualW))
 	binary.Write(stream, binary.BigEndian, uint16(actualH))
+	fmt.Printf("[Client] 已通知服务端画面尺寸: %dx%d\n", actualW, actualH)
+
+	// 5. 先尝试读取一帧，确认摄像头确实在工作
+	fmt.Println("[Client] 正在等待摄像头第一帧...")
+	firstImg, firstRelease, err := reader.Read()
+	if err != nil {
+		log.Fatalf("[Client] 读取摄像头第一帧失败: %v", err)
+	}
+	firstBounds := firstImg.Bounds()
+	fmt.Printf("[Client] 第一帧成功！实际尺寸: %dx%d\n", firstBounds.Dx(), firstBounds.Dy())
+
+	// 如果摄像头实际输出尺寸和声明的不一样，用实际的
+	if firstBounds.Dx() != actualW || firstBounds.Dy() != actualH {
+		actualW = firstBounds.Dx()
+		actualH = firstBounds.Dy()
+		fmt.Printf("[Client] 注意：摄像头实际输出尺寸为 %dx%d，已修正\n", actualW, actualH)
+		// 重新发送尺寸
+		binary.Write(stream, binary.BigEndian, uint16(actualW))
+		binary.Write(stream, binary.BigEndian, uint16(actualH))
+	}
+
+	// 处理第一帧
+	firstRGBA := toRGBA(firstImg)
+	firstRelease()
 
 	var prevImage *image.RGBA
 	frameBuffer := new(bytes.Buffer)
 	tileBuffer := new(bytes.Buffer)
+
+	// 发送第一帧 (全量)
+	sendFrame(stream, firstRGBA, nil, actualW, actualH, frameBuffer, tileBuffer)
+	prevImage = firstRGBA
+	fmt.Println("[Client] 第一帧已发送，进入持续推流模式...")
+
+	// 6. 持续采集循环
 	ticker := time.NewTicker(time.Second / time.Duration(FrameRate))
 	defer ticker.Stop()
+
+	frameCount := 0
+	errorCount := 0
 
 	for range ticker.C {
 		rawImg, release, err := reader.Read()
 		if err != nil {
-			log.Println("读取帧失败:", err)
+			errorCount++
+			if errorCount <= 5 {
+				log.Printf("[Client] 读取帧失败 (%d): %v", errorCount, err)
+			}
+			if errorCount >= 50 {
+				log.Fatal("[Client] 连续失败过多，退出")
+			}
 			continue
 		}
+		errorCount = 0 // 读取成功，重置计数
 
-		// 5. 转换为 RGBA
-		bounds := rawImg.Bounds()
 		currImage := toRGBA(rawImg)
 		release()
 
-		width := bounds.Dx()
-		height := bounds.Dy()
+		sendFrame(stream, currImage, prevImage, actualW, actualH, frameBuffer, tileBuffer)
+		prevImage = currImage
 
-		frameBuffer.Reset()
-		var dirtyTilesCount uint16
-		var totalJpegBytes int
+		frameCount++
+		if frameCount%50 == 0 {
+			fmt.Printf("\n[Client] 已发送 %d 帧\n", frameCount)
+		}
+	}
+}
 
-		// 6. 网格差异检测
-		for y := 0; y < height; y += GridSize {
-			for x := 0; x < width; x += GridSize {
-				tileRect := image.Rect(x, y, minInt(x+GridSize, width), minInt(y+GridSize, height))
+// ==========================================
+// 帧发送 (网格差异)
+// ==========================================
 
-				if isTileChanged(currImage, prevImage, tileRect) {
-					dirtyTilesCount++
+func sendFrame(stream quic.Stream, curr, prev *image.RGBA, width, height int, frameBuffer, tileBuffer *bytes.Buffer) {
+	frameBuffer.Reset()
+	var dirtyTilesCount uint16
+	var totalJpegBytes int
 
-					tileImg := currImage.SubImage(tileRect)
-					tileBuffer.Reset()
-					jpeg.Encode(tileBuffer, tileImg, &jpeg.Options{Quality: JpegQuality})
+	for y := 0; y < height; y += GridSize {
+		for x := 0; x < width; x += GridSize {
+			tileRect := image.Rect(x, y, minInt(x+GridSize, width), minInt(y+GridSize, height))
 
-					jpegData := tileBuffer.Bytes()
-					totalJpegBytes += len(jpegData)
+			if isTileChanged(curr, prev, tileRect) {
+				dirtyTilesCount++
 
-					binary.Write(frameBuffer, binary.BigEndian, int16(x))
-					binary.Write(frameBuffer, binary.BigEndian, int16(y))
-					binary.Write(frameBuffer, binary.BigEndian, uint32(len(jpegData)))
-					frameBuffer.Write(jpegData)
-				}
+				tileImg := curr.SubImage(tileRect)
+				tileBuffer.Reset()
+				jpeg.Encode(tileBuffer, tileImg, &jpeg.Options{Quality: JpegQuality})
+
+				jpegData := tileBuffer.Bytes()
+				totalJpegBytes += len(jpegData)
+
+				binary.Write(frameBuffer, binary.BigEndian, int16(x))
+				binary.Write(frameBuffer, binary.BigEndian, int16(y))
+				binary.Write(frameBuffer, binary.BigEndian, uint32(len(jpegData)))
+				frameBuffer.Write(jpegData)
 			}
 		}
-
-		payloadData := frameBuffer.Bytes()
-		totalSize := uint32(2 + len(payloadData))
-
-		binary.Write(stream, binary.BigEndian, totalSize)
-		binary.Write(stream, binary.BigEndian, dirtyTilesCount)
-		stream.Write(payloadData)
-
-		fmt.Printf("\r[+] 帧 | 变化网格: %4d | 流量: %4d KB   ", dirtyTilesCount, totalJpegBytes/1024)
-		prevImage = currImage
 	}
+
+	payloadData := frameBuffer.Bytes()
+	totalSize := uint32(2 + len(payloadData))
+
+	binary.Write(stream, binary.BigEndian, totalSize)
+	binary.Write(stream, binary.BigEndian, dirtyTilesCount)
+	stream.Write(payloadData)
+
+	fmt.Printf("\r[+] 帧 | 变化网格: %4d | 流量: %4d KB   ", dirtyTilesCount, totalJpegBytes/1024)
 }
 
 // ==========================================
@@ -378,23 +456,29 @@ func parseTargetRes(res string) (int, int) {
 
 func selectBestProp(props []prop.Media, targetW, targetH int) prop.Media {
 	if len(props) == 0 {
+		fmt.Println("[Client] 警告：摄像头未报告任何属性，使用手动配置")
 		p := prop.Media{}
 		p.Width = targetW
 		p.Height = targetH
-		p.FrameRate = float32(FrameRate)
+		p.FrameRate = 30
 		return p
 	}
 
 	fmt.Println("[Client] 摄像头支持的分辨率:")
 	seen := make(map[string]bool)
 	for _, p := range props {
-		key := fmt.Sprintf("  - %dx%d @ %.0ffps (格式: %s)", p.Width, p.Height, p.FrameRate, p.FrameFormat)
+		fpsStr := fmt.Sprintf("%.0f", p.FrameRate)
+		if p.FrameRate <= 0 {
+			fpsStr = "auto"
+		}
+		key := fmt.Sprintf("  - %dx%d @ %sfps (格式: %s)", p.Width, p.Height, fpsStr, p.FrameFormat)
 		if !seen[key] {
 			seen[key] = true
 			fmt.Println(key)
 		}
 	}
 
+	// 过滤有效的分辨率
 	var valid []prop.Media
 	for _, p := range props {
 		if p.Width > 0 && p.Height > 0 {
@@ -402,9 +486,15 @@ func selectBestProp(props []prop.Media, targetW, targetH int) prop.Media {
 		}
 	}
 	if len(valid) == 0 {
-		return props[0]
+		fmt.Println("[Client] 警告：没有有效分辨率，使用第一个属性")
+		best := props[0]
+		if best.FrameRate <= 0 {
+			best.FrameRate = 30
+		}
+		return best
 	}
 
+	// 按与目标的差距排序
 	sort.Slice(valid, func(i, j int) bool {
 		diffI := absInt(valid[i].Width-targetW) + absInt(valid[i].Height-targetH)
 		diffJ := absInt(valid[j].Width-targetW) + absInt(valid[j].Height-targetH)
@@ -413,6 +503,7 @@ func selectBestProp(props []prop.Media, targetW, targetH int) prop.Media {
 
 	best := valid[0]
 
+	// 同分辨率下优先选兼容性好的格式
 	for _, p := range valid {
 		diff := absInt(p.Width-targetW) + absInt(p.Height-targetH)
 		bestDiff := absInt(best.Width-targetW) + absInt(best.Height-targetH)
@@ -424,11 +515,17 @@ func selectBestProp(props []prop.Media, targetW, targetH int) prop.Media {
 		}
 	}
 
+	// 核心修复：如果摄像头报告帧率为 0，强制设为 30fps
+	if best.FrameRate <= 0 {
+		fmt.Println("[Client] 摄像头报告帧率为0，强制设为 30fps")
+		best.FrameRate = 30
+	}
+
 	return best
 }
 
 // ==========================================
-// 图像格式转换
+// 图像格式转换 (兼容 YUY2 / NV12 等各种格式)
 // ==========================================
 
 func toRGBA(img image.Image) *image.RGBA {
