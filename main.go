@@ -51,7 +51,7 @@ func init() {
 	flag.StringVar(&port, "port", "4242", "UDP 端口")
 	flag.BoolVar(&listDevices, "list-devices", false, "列出音视频设备及支持的分辨率")
 	flag.IntVar(&camID, "cam", 0, "摄像头设备序号")
-	flag.StringVar(&targetRes, "res", "1080", "目标分辨率: 480 / 720 / 1080")
+	flag.StringVar(&targetRes, "res", "1080", "目标分辨率: 480 / 720 / 1080 / 1440 / 4k")
 	flag.Parse()
 }
 
@@ -82,7 +82,6 @@ func printDeviceList() {
 		info := d.Info()
 		fmt.Printf("\n  [摄像头 %d] %s\n", i, info.Label)
 
-		// 临时打开设备以查询分辨率
 		if err := d.Open(); err != nil {
 			fmt.Printf("    (无法打开设备查询分辨率: %v)\n", err)
 			continue
@@ -95,13 +94,12 @@ func printDeviceList() {
 			continue
 		}
 
-		// 去重显示
 		seen := make(map[string]bool)
 		for _, p := range props {
-			key := fmt.Sprintf("%dx%d", p.Width, p.Height)
+			key := fmt.Sprintf("%dx%d @ %.0ffps (%s)", p.Width, p.Height, p.FrameRate, p.FrameFormat)
 			if !seen[key] {
 				seen[key] = true
-				fmt.Printf("    - %dx%d (%.0f fps)\n", p.Width, p.Height, p.FrameRate)
+				fmt.Printf("    - %s\n", key)
 			}
 		}
 	}
@@ -165,7 +163,68 @@ func runServer() {
 				continue
 			}
 			fmt.Println("[Server] 客户端已连接！")
-			go handleClient(conn, app)
+
+			go func() {
+				stream, err := conn.AcceptStream(context.Background())
+				if err != nil {
+					return
+				}
+
+				var frameW, frameH uint16
+				binary.Read(stream, binary.BigEndian, &frameW)
+				binary.Read(stream, binary.BigEndian, &frameH)
+				fmt.Printf("[Server] 客户端画面尺寸: %dx%d\n", frameW, frameH)
+
+				app.mu.Lock()
+				app.canvasW = int(frameW)
+				app.canvasH = int(frameH)
+				app.canvas = image.NewRGBA(image.Rect(0, 0, int(frameW), int(frameH)))
+				app.connected = true
+				app.mu.Unlock()
+
+				ebiten.SetWindowSize(int(frameW), int(frameH))
+
+				for {
+					var totalSize uint32
+					if err := binary.Read(stream, binary.BigEndian, &totalSize); err != nil {
+						log.Println("[Server] 连接断开:", err)
+						break
+					}
+
+					var tileCount uint16
+					if err := binary.Read(stream, binary.BigEndian, &tileCount); err != nil {
+						break
+					}
+
+					for i := 0; i < int(tileCount); i++ {
+						var x int16
+						var y int16
+						var jpegSize uint32
+						binary.Read(stream, binary.BigEndian, &x)
+						binary.Read(stream, binary.BigEndian, &y)
+						binary.Read(stream, binary.BigEndian, &jpegSize)
+
+						jpegData := make([]byte, jpegSize)
+						if _, err := io.ReadFull(stream, jpegData); err != nil {
+							break
+						}
+
+						tileImg, err := jpeg.Decode(bytes.NewReader(jpegData))
+						if err != nil {
+							continue
+						}
+
+						app.mu.Lock()
+						targetRect := image.Rect(int(x), int(y), int(x)+tileImg.Bounds().Dx(), int(y)+tileImg.Bounds().Dy())
+						draw.Draw(app.canvas, targetRect, tileImg, image.Point{0, 0}, draw.Src)
+						app.mu.Unlock()
+					}
+
+					if tileCount > 0 {
+						fmt.Printf("\r[Server] 收到 %4d 个变化网格", tileCount)
+					}
+				}
+			}()
 		}
 	}()
 
@@ -173,70 +232,6 @@ func runServer() {
 	ebiten.SetWindowResizingMode(ebiten.WindowResizingModeEnabled)
 	if err := ebiten.RunGame(app); err != nil {
 		log.Fatal(err)
-	}
-}
-
-func handleClient(conn quic.Connection, app *App) {
-	stream, err := conn.AcceptStream(context.Background())
-	if err != nil {
-		return
-	}
-
-	// 首先读取客户端发来的画面尺寸信息
-	var frameW, frameH uint16
-	binary.Read(stream, binary.BigEndian, &frameW)
-	binary.Read(stream, binary.BigEndian, &frameH)
-	fmt.Printf("[Server] 客户端画面尺寸: %dx%d\n", frameW, frameH)
-
-	app.mu.Lock()
-	app.canvasW = int(frameW)
-	app.canvasH = int(frameH)
-	app.canvas = image.NewRGBA(image.Rect(0, 0, int(frameW), int(frameH)))
-	app.connected = true
-	app.mu.Unlock()
-
-	// 动态调整窗口大小
-	ebiten.SetWindowSize(int(frameW), int(frameH))
-
-	for {
-		var totalSize uint32
-		if err := binary.Read(stream, binary.BigEndian, &totalSize); err != nil {
-			log.Println("[Server] 连接断开:", err)
-			break
-		}
-
-		var tileCount uint16
-		if err := binary.Read(stream, binary.BigEndian, &tileCount); err != nil {
-			break
-		}
-
-		for i := 0; i < int(tileCount); i++ {
-			var x int16
-			var y int16
-			var jpegSize uint32
-			binary.Read(stream, binary.BigEndian, &x)
-			binary.Read(stream, binary.BigEndian, &y)
-			binary.Read(stream, binary.BigEndian, &jpegSize)
-
-			jpegData := make([]byte, jpegSize)
-			if _, err := io.ReadFull(stream, jpegData); err != nil {
-				break
-			}
-
-			tileImg, err := jpeg.Decode(bytes.NewReader(jpegData))
-			if err != nil {
-				continue
-			}
-
-			app.mu.Lock()
-			targetRect := image.Rect(int(x), int(y), int(x)+tileImg.Bounds().Dx(), int(y)+tileImg.Bounds().Dy())
-			draw.Draw(app.canvas, targetRect, tileImg, image.Point{0, 0}, draw.Src)
-			app.mu.Unlock()
-		}
-
-		if tileCount > 0 {
-			fmt.Printf("\r[Server] 收到 %4d 个变化网格", tileCount)
-		}
 	}
 }
 
@@ -361,7 +356,7 @@ func runClient() {
 }
 
 // ==========================================
-// 分辨率选择 (核心修复)
+// 分辨率选择
 // ==========================================
 
 func parseTargetRes(res string) (int, int) {
@@ -390,7 +385,6 @@ func selectBestProp(props []prop.Media, targetW, targetH int) prop.Media {
 		return p
 	}
 
-	// 打印摄像头支持的所有分辨率，方便调试
 	fmt.Println("[Client] 摄像头支持的分辨率:")
 	seen := make(map[string]bool)
 	for _, p := range props {
@@ -401,7 +395,6 @@ func selectBestProp(props []prop.Media, targetW, targetH int) prop.Media {
 		}
 	}
 
-	// 过滤出所有有效分辨率 (宽高 > 0)
 	var valid []prop.Media
 	for _, p := range props {
 		if p.Width > 0 && p.Height > 0 {
@@ -412,7 +405,6 @@ func selectBestProp(props []prop.Media, targetW, targetH int) prop.Media {
 		return props[0]
 	}
 
-	// 按与目标分辨率的差距排序
 	sort.Slice(valid, func(i, j int) bool {
 		diffI := absInt(valid[i].Width-targetW) + absInt(valid[i].Height-targetH)
 		diffJ := absInt(valid[j].Width-targetW) + absInt(valid[j].Height-targetH)
@@ -421,7 +413,6 @@ func selectBestProp(props []prop.Media, targetW, targetH int) prop.Media {
 
 	best := valid[0]
 
-	// 优先选择 MJPEG 或 NV12 格式 (兼容性最好)
 	for _, p := range valid {
 		diff := absInt(p.Width-targetW) + absInt(p.Height-targetH)
 		bestDiff := absInt(best.Width-targetW) + absInt(best.Height-targetH)
@@ -433,12 +424,11 @@ func selectBestProp(props []prop.Media, targetW, targetH int) prop.Media {
 		}
 	}
 
-	// 不覆盖帧率，使用摄像头原生支持的帧率，避免冲突
 	return best
 }
 
 // ==========================================
-// 图像格式转换 (兼容各种摄像头输出格式)
+// 图像格式转换
 // ==========================================
 
 func toRGBA(img image.Image) *image.RGBA {
@@ -460,7 +450,6 @@ func isTileChanged(curr, prev *image.RGBA, rect image.Rectangle) bool {
 		return true
 	}
 
-	// 边界安全检查
 	currBounds := curr.Bounds()
 	prevBounds := prev.Bounds()
 	if rect.Max.X > currBounds.Max.X || rect.Max.Y > currBounds.Max.Y {
