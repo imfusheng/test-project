@@ -1,26 +1,30 @@
-name: Build Geek Monitor
+name: Build Geek Camera Monitor
 
-# 触发条件：当你修改代码，或者在网页上手动点击时触发
 on:
   push:
-    branches: [ "main", "master" ]
+    branches: [ "main" ]
   workflow_dispatch:
 
 jobs:
   build-windows:
     name: Build for Windows
-    runs-on: windows-latest # 白嫖微软的 Windows 服务器，自带 GCC 和 Git！
+    runs-on: windows-latest
 
     steps:
-    - name: 1. 拉取代码
+    - name: 拉取代码
       uses: actions/checkout@v4
 
-    - name: 2. 安装 Go 环境
+    - name: 安装 Go
       uses: actions/setup-go@v5
       with:
-        go-version: '1.22' # 使用较新的 Go 版本
+        go-version: '1.22'
 
-    - name: 3. 动态初始化 Go 模块 (云端补全依赖)
+    - name: 安装 MinGW GCC (CGO 必须)
+      uses: egor-tensin/setup-mingw@v2
+      with:
+        platform: x64
+
+    - name: 初始化 Go 模块
       run: |
         if (!(Test-Path go.mod)) {
           go mod init mymonitor
@@ -28,16 +32,15 @@ jobs:
         go mod tidy
       shell: powershell
 
-    - name: 4. 极致编译 (开启 CGO, 压缩体积)
-      # CGO_ENABLED=1 是必须的，因为摄像头库依赖底层 C 代码
-      # -ldflags="-s -w" 会去掉调试信息，让程序体积更小
+    - name: 编译
       run: |
         $env:CGO_ENABLED="1"
+        $env:CC="gcc"
         go build -ldflags="-s -w" -o monitor.exe main.go
       shell: powershell
 
-    - name: 5. 上传编译好的 EXE 供下载
+    - name: 上传产物
       uses: actions/upload-artifact@v4
       with:
-        name: monitor-windows
+        name: camera-monitor-windows
         path: monitor.exe
