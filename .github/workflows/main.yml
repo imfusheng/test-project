@@ -36,7 +36,7 @@ jobs:
       run: |
         $env:CGO_ENABLED="1"
         $env:CC="gcc"
-        go build -ldflags="-s -w" -o monitor.exe main.go
+        go build -ldflags="-s -w -extldflags '-static'" -o monitor.exe main.go
       shell: powershell
 
     - name: 上传产物
