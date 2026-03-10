@@ -56,7 +56,6 @@ func init() {
 }
 
 func main() {
-	// 全局 panic 捕获，防止 Windows 控制台闪退看不到错误
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[FATAL] 程序崩溃: %v", r)
@@ -340,7 +339,6 @@ func runClient() {
 		actualW = firstBounds.Dx()
 		actualH = firstBounds.Dy()
 		fmt.Printf("[Client] 注意：摄像头实际输出尺寸为 %dx%d，已修正\n", actualW, actualH)
-		// 重新发送尺寸
 		binary.Write(stream, binary.BigEndian, uint16(actualW))
 		binary.Write(stream, binary.BigEndian, uint16(actualH))
 	}
@@ -356,7 +354,7 @@ func runClient() {
 	// 发送第一帧 (全量)
 	sendFrame(stream, firstRGBA, nil, actualW, actualH, frameBuffer, tileBuffer)
 	prevImage = firstRGBA
-	fmt.Println("[Client] 第一帧已发送，进入持续推流模式...")
+	fmt.Println("\n[Client] 第一帧已发送，进入持续推流模式...")
 
 	// 6. 持续采集循环
 	ticker := time.NewTicker(time.Second / time.Duration(FrameRate))
@@ -377,7 +375,7 @@ func runClient() {
 			}
 			continue
 		}
-		errorCount = 0 // 读取成功，重置计数
+		errorCount = 0
 
 		currImage := toRGBA(rawImg)
 		release()
@@ -393,10 +391,10 @@ func runClient() {
 }
 
 // ==========================================
-// 帧发送 (网格差异)
+// 帧发送 (网格差异) - 参数用 io.ReadWriter 兼容所有版本
 // ==========================================
 
-func sendFrame(stream quic.Stream, curr, prev *image.RGBA, width, height int, frameBuffer, tileBuffer *bytes.Buffer) {
+func sendFrame(w io.Writer, curr, prev *image.RGBA, width, height int, frameBuffer, tileBuffer *bytes.Buffer) {
 	frameBuffer.Reset()
 	var dirtyTilesCount uint16
 	var totalJpegBytes int
@@ -426,9 +424,9 @@ func sendFrame(stream quic.Stream, curr, prev *image.RGBA, width, height int, fr
 	payloadData := frameBuffer.Bytes()
 	totalSize := uint32(2 + len(payloadData))
 
-	binary.Write(stream, binary.BigEndian, totalSize)
-	binary.Write(stream, binary.BigEndian, dirtyTilesCount)
-	stream.Write(payloadData)
+	binary.Write(w, binary.BigEndian, totalSize)
+	binary.Write(w, binary.BigEndian, dirtyTilesCount)
+	w.Write(payloadData)
 
 	fmt.Printf("\r[+] 帧 | 变化网格: %4d | 流量: %4d KB   ", dirtyTilesCount, totalJpegBytes/1024)
 }
@@ -478,7 +476,6 @@ func selectBestProp(props []prop.Media, targetW, targetH int) prop.Media {
 		}
 	}
 
-	// 过滤有效的分辨率
 	var valid []prop.Media
 	for _, p := range props {
 		if p.Width > 0 && p.Height > 0 {
@@ -494,7 +491,6 @@ func selectBestProp(props []prop.Media, targetW, targetH int) prop.Media {
 		return best
 	}
 
-	// 按与目标的差距排序
 	sort.Slice(valid, func(i, j int) bool {
 		diffI := absInt(valid[i].Width-targetW) + absInt(valid[i].Height-targetH)
 		diffJ := absInt(valid[j].Width-targetW) + absInt(valid[j].Height-targetH)
@@ -503,7 +499,6 @@ func selectBestProp(props []prop.Media, targetW, targetH int) prop.Media {
 
 	best := valid[0]
 
-	// 同分辨率下优先选兼容性好的格式
 	for _, p := range valid {
 		diff := absInt(p.Width-targetW) + absInt(p.Height-targetH)
 		bestDiff := absInt(best.Width-targetW) + absInt(best.Height-targetH)
@@ -515,7 +510,6 @@ func selectBestProp(props []prop.Media, targetW, targetH int) prop.Media {
 		}
 	}
 
-	// 核心修复：如果摄像头报告帧率为 0，强制设为 30fps
 	if best.FrameRate <= 0 {
 		fmt.Println("[Client] 摄像头报告帧率为0，强制设为 30fps")
 		best.FrameRate = 30
@@ -525,7 +519,7 @@ func selectBestProp(props []prop.Media, targetW, targetH int) prop.Media {
 }
 
 // ==========================================
-// 图像格式转换 (兼容 YUY2 / NV12 等各种格式)
+// 图像格式转换
 // ==========================================
 
 func toRGBA(img image.Image) *image.RGBA {
