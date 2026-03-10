@@ -19,10 +19,6 @@ jobs:
       with:
         go-version: '1.22'
 
-    - name: 安装 MinGW GCC (CGO 必须)
-      uses: egor-tensin/setup-mingw@v2
-      with:
-        platform: x64
 
     - name: 初始化 Go 模块
       run: |
